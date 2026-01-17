@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 karictre
+
 // src/map.js
 // Map initialization and routing integration (uses Leaflet + Leaflet Routing Machine)
 // Requires: leaflet, leaflet-routing-machine, Chart.js, src/elevation.js, src/shade.js
@@ -12,98 +15,117 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 }).addTo(map);
 
-// Routing control (uses public OSRM demo server by default).
-// For production / heavy usage self-host OSRM/Valhalla/GraphHopper or use an API key provider.
+// Use a Plan so we can manipulate waypoints reliably
+const plan = L.Routing.plan([], {
+  createMarker: (i, wp) => {
+    return L.marker(wp.latLng, { draggable: true });
+  }
+});
+
 const routingControl = L.Routing.control({
+  plan,
   router: L.Routing.osrmv1({
     serviceUrl: 'https://router.project-osrm.org/route/v1' // demo; self-host for production
   }),
   fitSelectedRoute: true,
   showAlternatives: false,
   routeWhileDragging: true,
-  createMarker: (i, wp, nWps) => {
-    // simple markers that are draggable
-    return L.marker(wp.latLng, { draggable: true });
-  },
   lineOptions: {
     styles: [{ color: '#0066cc', opacity: 0.8, weight: 6 }]
   }
 }).addTo(map);
 
-// Keep simple click-to-set-start-end UX
-let clickState = { firstSet: false };
+// Simple click-to-set-start-end UX using setWaypoints
+let pendingStart = null;
 map.on('click', (e) => {
-  const waypoints = routingControl.getWaypoints().filter(wp => wp.latLng);
-  if (!clickState.firstSet) {
-    // set start
-    routingControl.spliceWaypoints(0, 1, e.latlng);
-    clickState.firstSet = true;
+  if (!pendingStart) {
+    pendingStart = e.latlng;
+    // visually indicate start (temporary marker)
+    if (window.__tempStartMarker) window.__tempStartMarker.remove();
+    window.__tempStartMarker = L.marker(e.latlng, { opacity: 0.8 }).addTo(map).bindPopup('Start (click to set destination)').openPopup();
   } else {
-    // set end (replace second waypoint)
-    // if there are currently no second waypoints, push, else replace
-    if (waypoints.length < 2) {
-      routingControl.spliceWaypoints(waypoints.length, 0, e.latlng);
-    } else {
-      routingControl.spliceWaypoints(1, 1, e.latlng);
-    }
-    clickState.firstSet = false;
+    const start = pendingStart;
+    const end = e.latlng;
+    // clear temp marker
+    if (window.__tempStartMarker) { window.__tempStartMarker.remove(); window.__tempStartMarker = null; }
+    pendingStart = null;
+
+    // Set waypoints explicitly
+    routingControl.setWaypoints([start, end]);
   }
 });
 
-// When routes are found, request elevation and optionally shade analysis
+// Helper: normalize many coordinate representations into [lat, lng]
+function normalizeCoord(c) {
+  // L.LatLng-like object
+  if (c == null) return null;
+  if (typeof c.lat === 'number' && typeof c.lng === 'number') return [c.lat, c.lng];
+  // array: [lat, lng] or [lng, lat]
+  if (Array.isArray(c) && c.length >= 2) {
+    // Heuristic: if first element is between -90..90 and second between -180..180, treat [lat,lng]
+    const a = c[0], b = c[1];
+    if (Math.abs(a) <= 90 && Math.abs(b) <= 180) return [a, b]; // [lat, lng]
+    // otherwise assume [lng, lat] -> swap
+    return [b, a];
+  }
+  // Fallback: try to read as object with 0/1 indices
+  if (typeof c[0] === 'number' && typeof c[1] === 'number') {
+    return [c[0], c[1]];
+  }
+  return null;
+}
+
+// Extract an ordered array of [lat,lng] coords from the route object that LRM returns
+function extractRouteCoords(route) {
+  if (!route) return [];
+  // Common: route.coordinates is an array of L.LatLng or arrays
+  if (Array.isArray(route.coordinates) && route.coordinates.length > 0) {
+    const out = [];
+    for (const item of route.coordinates) {
+      const n = normalizeCoord(item);
+      if (n) out.push(n);
+    }
+    if (out.length > 0) return out;
+  }
+
+  // Some routers expose route.geometry as an object {coordinates: [[lng,lat], ...]}
+  if (route.geometry && Array.isArray(route.geometry.coordinates)) {
+    return route.geometry.coordinates.map(c => normalizeCoord(c));
+  }
+
+  // Fallback: use the routingControl waypoints
+  const wps = routingControl.getWaypoints().filter(wp => wp.latLng).map(wp => [wp.latLng.lat, wp.latLng.lng]);
+  return wps;
+}
+
+// When a route is found, request elevation and optionally shade analysis
 routingControl.on('routesfound', (e) => {
   const routes = e.routes;
   if (!routes || routes.length === 0) return;
-
-  // Use the first route
   const route = routes[0];
 
-  // Extract lat/lngs from route coordinates
-  // route.coordinates is an array of LatLng-like arrays [lat, lng] or L.LatLng
-  // In some versions it's route.coordinates as array of L.LatLng objects
-  let coords = [];
-  if (route.coordinates && route.coordinates.length) {
-    coords = route.coordinates.map(c => {
-      // if c is an object with lat/lng, normalize
-      if (c.lat !== undefined && c.lng !== undefined) return [c.lat, c.lng];
-      // if c is array [lat, lng]
-      if (Array.isArray(c) && c.length >= 2) return [c[1] !== undefined && c[0] !== undefined ? c[0] : c[1], c[1]];
-      // fallback (assume it's [lng, lat])
-      return [c[1], c[0]];
-    });
-  } else if (route.coordinates === undefined && route.geometry) {
-    // polyline encoded geometry — try to decode if available
-    try {
-      const decoded = L.Polyline.fromEncoded(route.geometry).getLatLngs();
-      coords = decoded.map(p => [p.lat, p.lng]);
-    } catch (err) {
-      console.warn('Could not decode route geometry', err);
-    }
+  const coords = extractRouteCoords(route);
+  if (!coords || coords.length === 0) {
+    console.warn('No coordinates extracted from route. Route object:', route);
+    return;
   }
 
-  if (coords.length === 0 && route.summary && route.waypoints) {
-    // fallback: use waypoints
-    coords = routingControl.getWaypoints().filter(wp => wp.latLng).map(wp => [wp.latLng.lat, wp.latLng.lng]);
-  }
-
-  if (coords.length > 0) {
-    // Request elevation data and draw profile
-    if (window.Elevation) {
-      window.Elevation.fetchElevationForCoordinates(coords)
-        .then(profile => {
-          window.Elevation.drawElevationChart(profile, 'elevationCanvas');
-          document.getElementById('elevationContainer').classList.remove('hidden');
-        })
-        .catch(err => {
-          console.warn('Elevation fetch failed', err);
-        });
-    } else {
-      console.warn('Elevation module not loaded.');
-    }
-  }
-
-  // store the last route coordinates for shade simulation button
+  // store for shade button
   routingControl._lastRouteCoords = coords;
+
+  // Request elevation data and draw profile
+  if (window.Elevation) {
+    window.Elevation.fetchElevationForCoordinates(coords)
+      .then(profile => {
+        window.Elevation.drawElevationChart(profile, 'elevationCanvas');
+        document.getElementById('elevationContainer').classList.remove('hidden');
+      })
+      .catch(err => {
+        console.warn('Elevation fetch failed', err);
+      });
+  } else {
+    console.warn('Elevation module not loaded.');
+  }
 });
 
 // Shade simulation button
@@ -116,7 +138,6 @@ shadeButton.addEventListener('click', () => {
   }
 
   if (window.ShadeSimulator) {
-    // Example: pass route coords and a time (now)
     window.ShadeSimulator.simulateShadeForRoute(coords, { date: new Date() })
       .then(() => {
         console.log('Shade simulation completed.');
@@ -130,6 +151,6 @@ shadeButton.addEventListener('click', () => {
   }
 });
 
-// Expose map and routingControl for debugging/REPL
+// Expose map and routingControl for debugging
 window.__map = map;
 window.__routingControl = routingControl;
