@@ -1,3 +1,12 @@
+## Preface/Notes
+This is a vibe coding project, but I came up with the idea.
+
+I wanted to see how vibe coding is, and if this works out well, I may keep it. If it works out very well, I may not even have to make manual changes!
+
+I aim to leave everything in this repository as-is, provided by GitHub Copilot.
+
+The title was a happy coincidence.
+
 # reimagined-adventure
 
 A completely FOSS-compliant GPS/GIS/interative map service with a focus on pedestrian features.
